@@ -40,6 +40,7 @@ pub mod opencode_catalog;
 pub mod opencode_launch;
 pub mod opencode_plugins;
 pub mod plan_approval;
+pub mod plan_revision;
 pub mod preflight;
 pub mod prompt_hydration;
 pub mod provider_models;
