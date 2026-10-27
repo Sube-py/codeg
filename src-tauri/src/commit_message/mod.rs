@@ -372,6 +372,7 @@ mod tests {
 
     fn claude_on_haiku() -> AssistantAgentConfig {
         AssistantAgentConfig {
+            after_plan_options: None,
             agent_type: AgentType::ClaudeCode,
             agent_options: AgentDelegationDefaults {
                 mode_id: None,

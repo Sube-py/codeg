@@ -78,6 +78,7 @@ use crate::acp::types::DelegationResultSummary;
 use crate::db::service::delegation_task_service::{
     DelegationTaskRecord, NewDelegationTask, TerminalUpdate,
 };
+use crate::models::assistant::AssistantRunPhase;
 use crate::models::AgentType;
 
 /// Default per-parent byte budget for cached completed-task result text. The
@@ -172,6 +173,7 @@ pub struct ChildResumeContext {
     /// may since have moved to another agent, while the session being resumed
     /// is still the original agent's.
     pub assistant: ResumeAssistant,
+    pub assistant_run_phase: Option<AssistantRunPhase>,
 }
 
 /// What a resume knows of the assistant a child ran as.
@@ -940,12 +942,13 @@ fn running_ack(
 fn launch_preferences(
     assistant: Option<&DelegationAssistant>,
     defaults: Option<&AgentDelegationDefaults>,
+    phase: Option<AssistantRunPhase>,
 ) -> (Option<String>, BTreeMap<String, String>) {
     match assistant {
-        Some(a) => (
-            a.agent_options.mode_id.clone(),
-            a.agent_options.config_values.clone(),
-        ),
+        Some(a) => {
+            let options = a.options_for_phase(phase);
+            (options.mode_id.clone(), options.config_values.clone())
+        }
         None => defaults
             .map(|d| (d.mode_id.clone(), d.config_values.clone()))
             .unwrap_or((None, BTreeMap::new())),
@@ -1686,6 +1689,16 @@ pub struct DelegationBroker {
 }
 
 impl DelegationBroker {
+    pub async fn set_run_phase(
+        &self,
+        child_conversation_id: i32,
+        phase: AssistantRunPhase,
+    ) -> Result<(), crate::db::error::DbError> {
+        self.ledger
+            .set_run_phase(child_conversation_id, phase)
+            .await
+    }
+
     pub fn new(
         spawner: Arc<dyn ConnectionSpawner>,
         depth_lookup: Arc<dyn ConversationDepthLookup>,
@@ -2831,6 +2844,7 @@ impl DelegationBroker {
         let (preferred_mode_id, preferred_config_values) = launch_preferences(
             req.assistant.as_ref(),
             cfg.agent_defaults.get(&req.agent_type),
+            Some(AssistantRunPhase::Planning),
         );
         // Checkpoint #1 (opportunistic): if a parent cancel already landed
         // during the claim/depth phase, bail before spawning a child the parent
@@ -3511,6 +3525,7 @@ impl DelegationBroker {
         let (preferred_mode_id, preferred_config_values) = launch_preferences(
             assistant.as_ref(),
             cfg.agent_defaults.get(&source.agent_type),
+            source.assistant_run_phase,
         );
         let call_id = uuid::Uuid::new_v4().to_string();
         let task_preview = truncate_on_char_boundary(&req.task, TASK_PREVIEW_CAP);
@@ -5324,8 +5339,11 @@ impl DelegationBroker {
         // from its row's snapshot, never from the assistant's current row nor
         // the per-agent defaults; no depth re-check — the child row already
         // exists at its chain position, resume adds no node.
-        let (preferred_mode_id, preferred_config_values) =
-            launch_preferences(assistant, cfg.agent_defaults.get(&ctx.agent_type));
+        let (preferred_mode_id, preferred_config_values) = launch_preferences(
+            assistant,
+            cfg.agent_defaults.get(&ctx.agent_type),
+            ctx.assistant_run_phase,
+        );
         // Checkpoint #1: a parent cancel during the gates — nothing spawned yet.
         if self.take_inflight_cancel(inflight_id).await {
             return report_from_outcome(
@@ -5930,6 +5948,7 @@ impl ChildStatusLookup for DbChildStatusLookup {
                     id,
                     name: snapshot.name,
                     agent_options: snapshot.agent_options,
+                    after_plan_options: snapshot.after_plan_options,
                     instructions: snapshot.instructions,
                 }),
                 Ok(_) => ResumeAssistant::Unrecoverable {
@@ -5948,7 +5967,15 @@ impl ChildStatusLookup for DbChildStatusLookup {
                 }
             },
         };
+        let assistant_run_phase =
+            crate::db::service::conversation_service::get_assistant_run_phase(
+                &self.db.conn,
+                summary.id,
+            )
+            .await
+            .ok()?;
         Some(ChildResumeContext {
+            assistant_run_phase,
             child_conversation_id: summary.id,
             status: task_status_from_row(&summary.status),
             agent_type: summary.agent_type,
@@ -10836,6 +10863,7 @@ mod tests {
             working_dir: Some("/work".into()),
             title: Some("do x".into()),
             assistant: ResumeAssistant::None,
+            assistant_run_phase: None,
         }
     }
 
@@ -11315,6 +11343,7 @@ mod tests {
 
     fn reviewer() -> DelegationAssistant {
         DelegationAssistant {
+            after_plan_options: None,
             id: 3,
             name: "Reviewer".into(),
             agent_options: AgentDelegationDefaults {

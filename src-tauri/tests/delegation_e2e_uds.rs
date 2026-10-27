@@ -725,6 +725,7 @@ fn reviewer_assistant() -> codeg_lib::models::AssistantInfo {
     codeg_lib::models::AssistantInfo {
         id: 3,
         uid: "uid-3".into(),
+        after_plan_options: None,
         name: "Reviewer".into(),
         description: "Reviews diffs".into(),
         avatar: codeg_lib::models::AssistantAvatar::Monogram {

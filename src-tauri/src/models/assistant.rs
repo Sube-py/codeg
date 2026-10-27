@@ -92,6 +92,8 @@ pub struct AssistantAgentConfig {
     pub agent_type: AgentType,
     #[serde(default)]
     pub agent_options: AgentDelegationDefaults,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_plan_options: Option<AgentDelegationDefaults>,
     pub label_snapshot: AssistantLabelSnapshot,
 }
 
@@ -105,6 +107,15 @@ impl AssistantAgentConfig {
     /// The editor re-probes when it opens, and launch replay skips a value the
     /// agent no longer advertises.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(options) = &self.after_plan_options {
+            if let Some(mode) = &options.mode_id {
+                check_value("after-plan mode", mode)?;
+            }
+            for (id, value) in &options.config_values {
+                check_value("after-plan option id", id)?;
+                check_value("after-plan option value", value)?;
+            }
+        }
         let snapshot = &self.label_snapshot;
         let values = &self.agent_options.config_values;
 
@@ -180,6 +191,8 @@ pub struct AssistantInfo {
     pub avatar: AssistantAvatar,
     pub agent_type: AgentType,
     pub agent_options: AgentDelegationDefaults,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_plan_options: Option<AgentDelegationDefaults>,
     pub label_snapshot: AssistantLabelSnapshot,
     pub instructions: String,
     pub enabled: bool,
@@ -252,8 +265,35 @@ pub struct AssistantRunSnapshot {
     pub name: String,
     #[serde(default)]
     pub agent_options: AgentDelegationDefaults,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_plan_options: Option<AgentDelegationDefaults>,
     #[serde(default)]
     pub instructions: String,
+}
+
+/// Mutable run state, never part of an assistant or its frozen snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantRunPhase {
+    Planning,
+    Executing,
+}
+
+impl AssistantRunPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Executing => "executing",
+        }
+    }
+
+    pub fn from_stored(value: Option<&str>) -> Option<Self> {
+        match value {
+            Some("planning") => Some(Self::Planning),
+            Some("executing") => Some(Self::Executing),
+            _ => None,
+        }
+    }
 }
 
 impl AssistantRunSnapshot {
@@ -305,6 +345,7 @@ mod tests {
         AssistantAgentConfig {
             agent_type: AgentType::Codex,
             agent_options: selection(mode.map(|(id, _)| id), values),
+            after_plan_options: None,
             label_snapshot: AssistantLabelSnapshot {
                 agent: "Codex CLI".to_string(),
                 mode: mode.map(|(_, name)| name.to_string()),
@@ -469,6 +510,7 @@ mod tests {
             },
             agent_type: AgentType::Codex,
             agent_options: selection(Some("read-only"), &[("model", "gpt-5.5")]),
+            after_plan_options: None,
             label_snapshot: AssistantLabelSnapshot {
                 agent: "Codex CLI".to_string(),
                 mode: Some("Read only".to_string()),
@@ -543,6 +585,7 @@ mod tests {
         let raw = serde_json::to_string(&AssistantRunSnapshot {
             name: "Reviewer".to_string(),
             agent_options: selection(None, &[("model", "m")]),
+            after_plan_options: None,
             instructions: "x".repeat(10_000),
         })
         .unwrap();

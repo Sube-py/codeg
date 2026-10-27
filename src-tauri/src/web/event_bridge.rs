@@ -878,6 +878,7 @@ mod tests {
             },
             agent_type: AgentType::Codex,
             agent_options: selection(None, &[]),
+            after_plan_options: None,
             label_snapshot: AssistantLabelSnapshot::default(),
             instructions: String::new(),
             enabled: true,

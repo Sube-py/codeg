@@ -1,7 +1,7 @@
 //! Connection-scoped Codex plan revisions. Receipts and physical boundary
 //! identities survive subsequent turns; lifecycle must never consult a live flag.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::app_error::AppCommandError;
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,8 @@ pub struct PlanRevision {
 #[derive(Debug, Default, Clone)]
 pub struct PlanRevisions {
     records: BTreeMap<String, PlanRevision>,
+    review_revision_pending: bool,
+    review_revision_boundaries: BTreeSet<u64>,
 }
 
 impl PlanRevisions {
@@ -91,6 +93,10 @@ impl PlanRevisions {
     }
 
     pub fn bind_boundary(&mut self, seq: u64) {
+        if self.review_revision_pending {
+            self.review_revision_boundaries.insert(seq);
+            self.review_revision_pending = false;
+        }
         for record in self.records.values_mut() {
             if record.status == RevisionStatus::Accepted && record.boundary_seq.is_none() {
                 record.boundary_seq = Some(seq);
@@ -99,7 +105,21 @@ impl PlanRevisions {
     }
 
     pub fn is_boundary(&self, seq: u64) -> bool {
+        self.review_revision_boundaries.contains(&seq) || self.is_feedback_boundary(seq)
+    }
+
+    pub fn is_feedback_boundary(&self, seq: u64) -> bool {
         self.records.values().any(|r| r.boundary_seq == Some(seq))
+    }
+
+    /// A plain revise answer has no feedback prompt to enqueue, but its
+    /// physical end_turn still must not settle and disconnect the delegation.
+    pub fn review_decided(&mut self, revising: bool) {
+        self.review_revision_pending = revising;
+    }
+
+    pub fn is_revising(&self) -> bool {
+        self.review_revision_pending || self.has_accepted()
     }
 
     pub fn take_next(&mut self) -> Option<PlanRevision> {
@@ -118,6 +138,7 @@ impl PlanRevisions {
     }
 
     pub fn abort_pending(&mut self) {
+        self.review_revision_pending = false;
         for record in self.records.values_mut() {
             if matches!(
                 record.status,

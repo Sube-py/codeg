@@ -78,6 +78,7 @@ impl From<AssistantInfo> for DelegationAssistant {
             id: a.id,
             name: a.name,
             agent_options: a.agent_options,
+            after_plan_options: a.after_plan_options,
             instructions: a.instructions,
         }
     }

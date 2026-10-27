@@ -238,6 +238,7 @@ pub struct NormalizedAssistant {
     pub avatar_json: String,
     pub agent_type: String,
     pub agent_options_json: String,
+    pub after_plan_options_json: Option<String>,
     pub label_snapshot_json: String,
     pub instructions: String,
     pub enabled: bool,
@@ -254,6 +255,12 @@ pub fn normalize_draft(draft: &AssistantDraft) -> Result<NormalizedAssistant, As
         avatar_json: to_json(&draft.avatar)?,
         agent_type,
         agent_options_json,
+        after_plan_options_json: draft
+            .agent_config
+            .after_plan_options
+            .as_ref()
+            .map(to_json)
+            .transpose()?,
         label_snapshot_json,
         instructions: normalize_instructions(&draft.instructions)?,
         enabled: draft.enabled,
@@ -329,6 +336,10 @@ pub fn to_info(m: assistant::Model) -> Option<AssistantInfo> {
         avatar,
         agent_type,
         agent_options,
+        after_plan_options: m
+            .after_plan_options
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
         label_snapshot,
         instructions: m.instructions,
         enabled: m.enabled,
@@ -448,6 +459,7 @@ pub async fn create(
         avatar: Set(row.avatar_json),
         agent_type: Set(row.agent_type),
         agent_options: Set(row.agent_options_json),
+        after_plan_options: Set(row.after_plan_options_json),
         label_snapshot: Set(row.label_snapshot_json),
         instructions: Set(row.instructions),
         enabled: Set(row.enabled),
@@ -522,6 +534,18 @@ pub async fn update(
     }
     if let Some(avatar) = avatar {
         query = query.col_expr(assistant::Column::Avatar, Expr::value(avatar));
+    }
+    if let Some(config) = &patch.agent_config {
+        query = query.col_expr(
+            assistant::Column::AfterPlanOptions,
+            Expr::value(
+                config
+                    .after_plan_options
+                    .as_ref()
+                    .map(to_json)
+                    .transpose()?,
+            ),
+        );
     }
     if let Some((agent_type, options, labels)) = agent {
         query = query
@@ -772,6 +796,10 @@ pub async fn import_into(
                         Expr::value(row.agent_options_json),
                     )
                     .col_expr(
+                        assistant::Column::AfterPlanOptions,
+                        Expr::value(row.after_plan_options_json),
+                    )
+                    .col_expr(
                         assistant::Column::LabelSnapshot,
                         Expr::value(row.label_snapshot_json),
                     )
@@ -806,6 +834,7 @@ pub async fn import_into(
                     avatar: Set(row.avatar_json),
                     agent_type: Set(row.agent_type),
                     agent_options: Set(row.agent_options_json),
+                    after_plan_options: Set(row.after_plan_options_json),
                     label_snapshot: Set(row.label_snapshot_json),
                     instructions: Set(row.instructions),
                     enabled: Set(row.enabled),
@@ -862,6 +891,7 @@ mod tests {
         AssistantAgentConfig {
             agent_type: AgentType::Codex,
             agent_options: selection(None, &[("model", "gpt-5.5"), ("effort", effort)]),
+            after_plan_options: None,
             label_snapshot: AssistantLabelSnapshot {
                 agent: "Codex CLI".to_string(),
                 mode: None,
@@ -922,6 +952,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn after_plan_options_round_trip_update_and_clear_independently_of_startup() {
+        let db = fresh_in_memory_db().await;
+        let mut input = draft("Planner");
+        let after = selection(
+            None,
+            &[("collaboration_mode", "default"), ("sandbox", "read-only")],
+        );
+        input.agent_config.after_plan_options = Some(after.clone());
+        let created = create(&db.conn, &input).await.unwrap();
+        assert_eq!(created.after_plan_options, Some(after.clone()));
+        let renamed = update(
+            &db.conn,
+            created.id,
+            &AssistantPatch {
+                name: Some("Renamed".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed.after_plan_options, Some(after));
+        input.agent_config.after_plan_options = None;
+        let cleared = update(
+            &db.conn,
+            created.id,
+            &AssistantPatch {
+                agent_config: Some(input.agent_config.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.after_plan_options, None);
+        assert_eq!(cleared.agent_options, input.agent_config.agent_options);
+    }
+
+    #[tokio::test]
     async fn create_lists_and_reads_back_the_whole_row() {
         let db = fresh_in_memory_db().await;
         let a = create(&db.conn, &draft("Reviewer")).await.expect("create");
@@ -979,6 +1046,7 @@ mod tests {
             avatar: Set("{}".to_string()),
             agent_type: Set("codex".to_string()),
             agent_options: Set("{}".to_string()),
+            after_plan_options: Set(None),
             label_snapshot: Set("{}".to_string()),
             instructions: Set(String::new()),
             enabled: Set(true),
@@ -1308,6 +1376,7 @@ mod tests {
             avatar: "not json".to_string(),
             agent_type: "codex".to_string(),
             agent_options: "not json".to_string(),
+            after_plan_options: None,
             label_snapshot: "not json".to_string(),
             instructions: String::new(),
             enabled: true,

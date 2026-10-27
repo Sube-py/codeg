@@ -2757,6 +2757,7 @@ impl ConnectionManager {
                         origin_cwd: Set(None),
                         assistant_id: Set(None),
                         assistant_snapshot: Set(None),
+                        assistant_run_phase: Set(None),
                         source: Set(source),
                     };
                     let inserted = sibling.insert(txn).await?;
@@ -6447,6 +6448,7 @@ mod tests {
                         snapshot: crate::models::AssistantRunSnapshot {
                             name: "Reviewer".into(),
                             agent_options: Default::default(),
+                            after_plan_options: None,
                             instructions: "Cite lines.".into(),
                         },
                     }),

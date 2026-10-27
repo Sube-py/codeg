@@ -29,6 +29,7 @@ use crate::acp::delegation::types::{
 use crate::db::entities::delegation_task::{self, Model as DelegationTaskModel};
 use crate::db::entities::{conversation, folder};
 use crate::db::error::DbError;
+use crate::models::assistant::AssistantRunPhase;
 use crate::models::{AgentType, AssistantRunSnapshot};
 
 /// A round about to start. `task_id` is minted by the broker; a continue
@@ -82,6 +83,7 @@ pub struct DelegationTaskRecord {
     pub working_dir: Option<String>,
     pub assistant: Option<DelegationAssistant>,
     pub assistant_ref: Option<AssistantRef>,
+    pub assistant_run_phase: Option<AssistantRunPhase>,
     pub task_preview: Option<String>,
     pub status: TaskStatus,
     pub error_code: Option<String>,
@@ -345,14 +347,17 @@ pub async fn resolve(
             .and_then(AssistantRunSnapshot::name_from_json)
     });
     let assistant = match (assistant_id, snapshot_raw.as_deref()) {
-        (Some(id), Some(raw)) => serde_json::from_str::<AssistantRunSnapshot>(raw)
-            .ok()
-            .map(|snapshot| DelegationAssistant {
-                id,
-                name: snapshot.name,
-                agent_options: snapshot.agent_options,
-                instructions: snapshot.instructions,
-            }),
+        (Some(id), Some(raw)) => {
+            serde_json::from_str::<AssistantRunSnapshot>(raw)
+                .ok()
+                .map(|snapshot| DelegationAssistant {
+                    id,
+                    name: snapshot.name,
+                    agent_options: snapshot.agent_options,
+                    after_plan_options: snapshot.after_plan_options,
+                    instructions: snapshot.instructions,
+                })
+        }
         _ => None,
     };
     let successor_task_id = find_successor(conn, &row.task_id)
@@ -374,6 +379,11 @@ pub async fn resolve(
             name: assistant_name.clone().unwrap_or_default(),
         }),
         assistant,
+        assistant_run_phase: AssistantRunPhase::from_stored(
+            child
+                .as_ref()
+                .and_then(|c| c.assistant_run_phase.as_deref()),
+        ),
         task_preview: row.task_preview,
         status: status_from_str(&row.status),
         error_code: row.error_code,
@@ -471,6 +481,19 @@ pub struct DbDelegationTaskLedger {
 
 #[async_trait::async_trait]
 impl DelegationTaskLedger for DbDelegationTaskLedger {
+    async fn set_run_phase(
+        &self,
+        child_conversation_id: i32,
+        phase: AssistantRunPhase,
+    ) -> Result<(), DbError> {
+        super::conversation_service::set_assistant_run_phase(
+            &self.db.conn,
+            child_conversation_id,
+            phase,
+        )
+        .await
+    }
+
     async fn insert(&self, task: NewDelegationTask) -> Result<(), DbError> {
         super::delegation_task_service::insert(&self.db.conn, task)
             .await

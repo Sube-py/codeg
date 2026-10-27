@@ -2822,6 +2822,7 @@ mod tests {
                     working_dir: Some("/work".into()),
                     title: Some("do x".into()),
                     assistant: crate::acp::delegation::broker::ResumeAssistant::None,
+                    assistant_run_phase: None,
                 })
             }
         }
@@ -4314,6 +4315,7 @@ mod tests {
         crate::models::AssistantInfo {
             id,
             uid: format!("u-{id}"),
+            after_plan_options: None,
             name: name.into(),
             description: format!("{name} description"),
             avatar: crate::models::AssistantAvatar::Monogram {

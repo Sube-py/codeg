@@ -1427,7 +1427,8 @@ impl SessionState {
                 if !self.agent_initiated_turn {
                     // A claimed revision owns the next serial prompt too. Do
                     // not admit an unrelated prompt in the physical turn gap.
-                    self.turn_in_flight = self.plan_revisions.is_boundary(self.event_seq + 1);
+                    self.turn_in_flight =
+                        self.plan_revisions.is_feedback_boundary(self.event_seq + 1);
                 }
                 self.agent_initiated_turn = false;
                 // Same edge, the identity half: anyone holding "the turn I was

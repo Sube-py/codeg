@@ -622,6 +622,8 @@ pub struct AssistantDto {
     pub agent_type: String,
     #[serde(default)]
     pub agent_options: AgentDelegationDefaults,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_plan_options: Option<AgentDelegationDefaults>,
     pub label_snapshot: AssistantLabelSnapshot,
     #[serde(default)]
     pub instructions: String,
@@ -666,6 +668,7 @@ fn assistant_row(
         agent_config: AssistantAgentConfig {
             agent_type,
             agent_options: dto.agent_options.clone(),
+            after_plan_options: dto.after_plan_options.clone(),
             label_snapshot: dto.label_snapshot.clone(),
         },
         instructions: dto.instructions.clone(),
@@ -728,6 +731,7 @@ fn collect_assistants(conn: &DatabaseConnection) -> BoxFuture<'_, Result<Value, 
                     avatar: a.avatar,
                     agent_type: a.agent_type.as_wire().into_owned(),
                     agent_options: a.agent_options,
+                    after_plan_options: a.after_plan_options,
                     label_snapshot: a.label_snapshot,
                     instructions: a.instructions,
                     enabled: a.enabled,
@@ -1149,6 +1153,7 @@ mod tests {
             agent_config: AssistantAgentConfig {
                 agent_type: AgentType::Codex,
                 agent_options: row.agent_options,
+                after_plan_options: row.after_plan_options,
                 label_snapshot: row.label_snapshot,
             },
             instructions: row.instructions,
@@ -1364,7 +1369,12 @@ mod tests {
     #[tokio::test]
     async fn collecting_carries_live_assistants_whole() {
         let source = crate::db::test_helpers::fresh_in_memory_db().await;
-        let kept = assistant_service::create(&source.conn, &local_draft("Reviewer"))
+        let mut draft = local_draft("Reviewer");
+        draft.agent_config.after_plan_options = Some(crate::models::assistant::selection(
+            None,
+            &[("collaboration_mode", "default")],
+        ));
+        let kept = assistant_service::create(&source.conn, &draft)
             .await
             .expect("create");
         let gone = assistant_service::create(&source.conn, &local_draft("Writer"))
@@ -1388,6 +1398,7 @@ mod tests {
         assert_eq!(landed.avatar, kept.avatar);
         assert_eq!(landed.agent_type, kept.agent_type);
         assert_eq!(landed.agent_options, kept.agent_options);
+        assert_eq!(landed.after_plan_options, kept.after_plan_options);
         assert_eq!(landed.label_snapshot, kept.label_snapshot);
         assert_eq!(landed.instructions, kept.instructions);
         assert_eq!(landed.enabled, kept.enabled);

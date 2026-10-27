@@ -28,6 +28,8 @@ pub struct Model {
     /// JSON `AgentDelegationDefaults`, complete against `label_snapshot`.
     #[sea_orm(column_type = "Text")]
     pub agent_options: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub after_plan_options: Option<String>,
     /// JSON `AssistantLabelSnapshot`.
     #[sea_orm(column_type = "Text")]
     pub label_snapshot: String,

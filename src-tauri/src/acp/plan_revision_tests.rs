@@ -29,8 +29,8 @@ impl ConversationDepthLookup for FlatDepth {
 }
 
 struct RevisionHarness {
-    db: AppDatabase,
-    manager: ConnectionManager,
+    db: Arc<AppDatabase>,
+    manager: Arc<ConnectionManager>,
     broker: Arc<DelegationBroker>,
     spawner: Arc<MockSpawner>,
     completed: Arc<MockEventEmitter>,
@@ -58,21 +58,48 @@ impl RevisionHarness {
         fail_second: PromptFailure,
         ordinary: bool,
     ) -> Self {
-        let db = test_helpers::fresh_in_memory_db().await;
+        let db = Arc::new(test_helpers::fresh_in_memory_db().await);
         let folder = test_helpers::seed_folder(&db, "/tmp/plan-revision").await;
-        let conv = conversation_service::create(&db.conn, folder, agent_type, None, None)
+        let parent = test_helpers::seed_conversation(&db, folder, agent_type).await;
+        let assistant = super::plan_execution_tests::assistant_with_policy(true);
+        let conv = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            agent_type,
+            None,
+            None,
+            Some(crate::acp::delegation::spawner::DelegationLink {
+                parent_conversation_id: parent,
+                parent_tool_use_id: "tool-parent".into(),
+                delegation_call_id: "revision-run".into(),
+                assistant: Some(crate::acp::delegation::spawner::AssistantLink {
+                    id: assistant.id,
+                    snapshot: assistant.run_snapshot(),
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, conv.id, "session-plan", &[])
             .await
             .unwrap();
         let spawner = Arc::new(MockSpawner::new());
         spawner.queue_spawn(Ok("revision-child".into())).await;
         spawner.queue_send(Ok(conv.id)).await;
         let completed = Arc::new(MockEventEmitter::new());
-        let broker = Arc::new(DelegationBroker::with_writers(
-            spawner.clone(),
-            Arc::new(FlatDepth),
-            Arc::new(NoopMetaWriter),
-            completed.clone(),
-        ));
+        let broker = Arc::new(
+            DelegationBroker::with_writers(
+                spawner.clone(),
+                Arc::new(FlatDepth),
+                Arc::new(NoopMetaWriter),
+                completed.clone(),
+            )
+            .with_ledger(Arc::new(
+                crate::db::service::delegation_task_service::DbDelegationTaskLedger {
+                    db: db.clone(),
+                },
+            )),
+        );
         broker
             .set_config(DelegationConfig {
                 enabled: true,
@@ -89,7 +116,7 @@ impl RevisionHarness {
                 working_dir: None,
                 requested_working_dir: None,
                 external_handle: None,
-                assistant: None,
+                assistant: Some(assistant),
             })
             .await;
         let task_id = report.task_id.unwrap();
@@ -110,7 +137,7 @@ impl RevisionHarness {
         let events = state.read().await.event_stream().subscribe();
         let perms = PendingPermissions::default();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-        let manager = ConnectionManager::new();
+        let manager = Arc::new(ConnectionManager::new());
         manager.connections.lock().await.insert(
             "revision-child".into(),
             AgentConnection {
@@ -193,6 +220,8 @@ impl RevisionHarness {
         let handler_state = state.clone();
         let loop_state = state.clone();
         let handler_perms = perms.clone();
+        let injection =
+            super::plan_execution_tests::injection(broker.clone(), db.clone(), manager.clone());
         let client = tokio::spawn(async move {
             let _ = Client
                 .builder()
@@ -233,7 +262,7 @@ impl RevisionHarness {
                         false,
                         &[],
                         &background_watch::PromptLedger::shared(),
-                        None,
+                        Some(&injection),
                         &Arc::new(StderrTail::new()),
                     )
                     .await?;
@@ -350,6 +379,12 @@ impl RevisionHarness {
                 .as_deref(),
             Some(self.task_id.as_str())
         );
+        assert_eq!(
+            conversation_service::get_assistant_run_phase(&self.db.conn, self.conversation_id)
+                .await
+                .unwrap(),
+            Some(crate::models::assistant::AssistantRunPhase::Planning)
+        );
         assert_eq!(self.broker.pending_count().await, 1);
         assert!(self.completed.calls.lock().await.is_empty());
         assert!(self.spawner.disconnects.lock().await.is_empty());
@@ -365,6 +400,24 @@ impl RevisionHarness {
             "in_progress"
         );
     }
+}
+
+#[tokio::test]
+async fn plain_revise_plan_keeps_planning_without_settling_the_delegation() {
+    let mut h = RevisionHarness::start(AgentType::Codex, false, PromptFailure::None, false).await;
+    let request = h.review().await;
+    h.answer(&request, "revise_plan").await;
+    h.final_turn().await;
+    h.assert_running().await;
+    assert!(
+        !h.state.read().await.turn_in_flight,
+        "a manual follow-up is allowed"
+    );
+    assert_eq!(
+        h.prompts.lock().unwrap().len(),
+        1,
+        "no invented feedback prompt"
+    );
 }
 
 #[tokio::test]
@@ -390,6 +443,12 @@ async fn codex_plan_revision_twice_keeps_session_task_and_completes_once() {
     h.assert_running().await;
     h.answer(&third, "implement_plan").await;
     h.final_turn().await;
+    assert_eq!(
+        conversation_service::get_assistant_run_phase(&h.db.conn, h.conversation_id)
+            .await
+            .unwrap(),
+        Some(crate::models::assistant::AssistantRunPhase::Executing)
+    );
     assert_eq!(
         h.change(&third, "too late").await.unwrap_err().message,
         "plan_review_already_decided"
@@ -422,6 +481,38 @@ async fn codex_plan_revision_twice_keeps_session_task_and_completes_once() {
     );
     assert!(h.spawner.continue_spawn_args.lock().await.is_empty());
     assert_eq!(h.spawner.spawn_args.lock().await.len(), 1);
+    h.spawner
+        .queue_continue_spawn(Ok(crate::acp::delegation::spawner::ResumedSpawn::fresh(
+            "next-round",
+        )))
+        .await;
+    h.spawner.queue_continue_send(Ok(())).await;
+    let continued = h
+        .broker
+        .continue_delegation(crate::acp::delegation::types::ContinueDelegationRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 1,
+            parent_tool_use_id: "tool-next".into(),
+            task_id: h.task_id.clone(),
+            task: "Review the result".into(),
+            external_handle: None,
+        })
+        .await;
+    assert_eq!(
+        continued.status,
+        crate::acp::delegation::types::TaskStatus::Running,
+        "{continued:?}"
+    );
+    let spawn = h.spawner.continue_spawn_args.lock().await[0].clone();
+    assert_eq!(
+        spawn.preferred_config_values["collaboration_mode"],
+        "default"
+    );
+    assert_eq!(spawn.preferred_config_values["sandbox"], "read-only");
+    assert_eq!(
+        h.spawner.continue_send_args.lock().await[0].child_conversation_id,
+        h.conversation_id
+    );
 }
 
 #[tokio::test]
@@ -469,8 +560,15 @@ async fn codex_plan_revision_plain_no_and_unrelated_permissions_keep_original_be
         h.final_turn().await;
         assert_eq!(h.prompts.lock().unwrap().len(), 1);
         assert!(h.state.read().await.to_snapshot().plan_revisions.is_empty());
-        assert_eq!(h.completed.calls.lock().await.len(), 1);
-        assert_eq!(h.spawner.disconnects.lock().await.len(), 1);
+        let planning = agent == AgentType::Codex && !ordinary;
+        assert_eq!(h.completed.calls.lock().await.len(), usize::from(!planning));
+        assert_eq!(
+            h.spawner.disconnects.lock().await.len(),
+            usize::from(!planning)
+        );
+        if planning {
+            h.assert_running().await;
+        }
         assert!(h.spawner.cancels.lock().await.is_empty());
     }
 }

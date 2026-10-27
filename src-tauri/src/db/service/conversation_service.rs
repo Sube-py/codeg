@@ -10,6 +10,7 @@ use crate::db::entities::conversation::ConversationKind;
 use crate::db::entities::{conversation, folder};
 use crate::db::error::DbError;
 use crate::db::service::conversation_tag_service;
+use crate::models::assistant::AssistantRunPhase;
 use crate::models::{AgentType, AssistantRunSnapshot, DbConversationSummary};
 
 pub async fn create(
@@ -134,6 +135,7 @@ async fn create_inner(
         origin_cwd: Set(None),
         assistant_id: Set(assistant_id),
         assistant_snapshot: Set(assistant_snapshot),
+        assistant_run_phase: Set(parent_id.map(|_| AssistantRunPhase::Planning.as_str().to_owned())),
         source: Set(None),
     };
     Ok(model.insert(conn).await?)
@@ -939,6 +941,7 @@ struct CarriedOverRow {
     origin_cwd: Option<String>,
     assistant_id: Option<i32>,
     assistant_snapshot: Option<String>,
+    assistant_run_phase: Option<String>,
     source: Option<String>,
 }
 
@@ -982,6 +985,7 @@ impl CarriedOverRow {
             // so it keeps drawing as it.
             assistant_id: row.assistant_id,
             assistant_snapshot: row.assistant_snapshot.clone(),
+            assistant_run_phase: row.assistant_run_phase.clone(),
             // Carried: the history was started where the conversation was.
             source: row.source.clone(),
         }
@@ -1015,6 +1019,7 @@ impl CarriedOverRow {
             origin_cwd: Set(self.origin_cwd),
             assistant_id: Set(self.assistant_id),
             assistant_snapshot: Set(self.assistant_snapshot),
+            assistant_run_phase: Set(self.assistant_run_phase),
             source: Set(self.source),
         }
     }
@@ -1530,6 +1535,35 @@ pub async fn list_children(
     let mut summaries: Vec<DbConversationSummary> = rows.into_iter().map(conv_to_summary).collect();
     fill_summary_extras(conn, &mut summaries).await?;
     Ok(summaries)
+}
+
+/// Update only runtime policy state; the assistant and its snapshot stay frozen.
+pub async fn set_assistant_run_phase(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    phase: AssistantRunPhase,
+) -> Result<(), DbError> {
+    use sea_orm::sea_query::Expr;
+    conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::AssistantRunPhase,
+            Expr::value(phase.as_str()),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .filter(conversation::Column::ParentId.is_not_null())
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_assistant_run_phase(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Option<AssistantRunPhase>, DbError> {
+    Ok(conversation::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+        .and_then(|row| AssistantRunPhase::from_stored(row.assistant_run_phase.as_deref())))
 }
 
 #[cfg(test)]

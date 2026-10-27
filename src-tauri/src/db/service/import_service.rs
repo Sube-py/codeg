@@ -526,6 +526,7 @@ async fn import_one(
         origin_cwd: Set(None),
         assistant_id: Set(None),
         assistant_snapshot: Set(None),
+        assistant_run_phase: Set(None),
         source: Set(None),
     };
     conv.insert(conn).await?;
@@ -976,6 +977,7 @@ mod tests {
             origin_cwd: Set(None),
             assistant_id: Set(None),
             assistant_snapshot: Set(None),
+            assistant_run_phase: Set(None),
             source: Set(None),
         }
         .insert(&db.conn)
@@ -1266,6 +1268,7 @@ mod tests {
             origin_cwd: Set(None),
             assistant_id: Set(None),
             assistant_snapshot: Set(None),
+            assistant_run_phase: Set(None),
             source: Set(None),
         }
         .insert(&db.conn)

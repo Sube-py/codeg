@@ -9,14 +9,15 @@ pub(super) async fn request_plan_changes(
     emitter: &EventEmitter,
     request_id: String,
     feedback: String,
+    injection: Option<&DelegationInjection>,
 ) -> Result<PlanRevisionReceipt, AppCommandError> {
     let feedback = PlanRevisions::normalize(&feedback)?;
     // Queue -> state is the permission subsystem's lock order. Persist the
     // claim BEFORE releasing Codex's responder; even an immediate end_turn
     // cannot overtake this command on the serial conversation loop.
     let mut queue = perms.lock().await;
-    {
-        let mut s = state.write().await;
+    let phase = {
+        let s = state.write().await;
         if let Some(receipt) = s.plan_revisions.retry(&request_id, &feedback)? {
             return Ok(receipt);
         }
@@ -39,8 +40,20 @@ pub(super) async fn request_plan_changes(
         if !s.turn_in_flight || s.plan_revisions.has_accepted() {
             return Err(AppCommandError::not_found("plan_review_not_pending"));
         }
-        s.plan_revisions.accept(request_id.clone(), feedback);
-    }
+        drop(s);
+        let phase = prepare_plan_decision(&mut queue, state, injection, &request_id, "revise_plan")
+            .await
+            .map_err(|e| {
+                AppCommandError::task_execution_failed("plan_phase_write_failed")
+                    .with_detail(e.to_string())
+            })?;
+        state
+            .write()
+            .await
+            .plan_revisions
+            .accept(request_id.clone(), feedback);
+        phase
+    };
     resolve_permission_locked(
         &mut queue,
         state,
@@ -48,6 +61,7 @@ pub(super) async fn request_plan_changes(
         request_id.clone(),
         "revise_plan".into(),
         PermissionAnswerOrigin::User,
+        phase,
     )
     .await;
     Ok(PlanRevisions::receipt(&request_id))

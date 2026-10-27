@@ -81,9 +81,17 @@ use crate::web::event_bridge::{
 mod plan_revision_permission;
 use plan_revision_permission::{fail_plan_revisions, request_plan_changes};
 
+#[path = "plan_execution.rs"]
+mod plan_execution;
+use plan_execution::{prepare_plan_decision, PlanExecutionFallback};
+
 #[cfg(test)]
 #[path = "plan_revision_tests.rs"]
 mod plan_revision_tests;
+
+#[cfg(test)]
+#[path = "plan_execution_tests.rs"]
+mod plan_execution_tests;
 
 /// Injected into the agent process only when the user has opted in — see
 /// [`force_command_color_enabled`] for why it is not a default.
@@ -3488,9 +3496,34 @@ async fn resolve_permission(
     request_id: String,
     option_id: String,
     origin: PermissionAnswerOrigin,
-) {
+    injection: Option<&DelegationInjection>,
+) -> Option<crate::models::assistant::AssistantRunPhase> {
     let mut queue = perms.lock().await;
-    resolve_permission_locked(&mut queue, state, emitter, request_id, option_id, origin).await;
+    let phase =
+        match prepare_plan_decision(&mut queue, state, injection, &request_id, &option_id).await {
+            Ok(phase) => phase,
+            Err(e) => {
+                tracing::error!("[ACP] could not persist plan decision: {e}");
+                let agent_type = state.read().await.agent_type.to_string();
+                emit_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::Error {
+                        message: format!("Could not save plan decision: {e}"),
+                        agent_type,
+                        code: Some("plan_phase_write_failed".into()),
+                        details: None,
+                        terminal: false,
+                    },
+                )
+                .await;
+                return None;
+            }
+        };
+    resolve_permission_locked(
+        &mut queue, state, emitter, request_id, option_id, origin, phase,
+    )
+    .await
 }
 
 async fn resolve_permission_locked(
@@ -3500,10 +3533,11 @@ async fn resolve_permission_locked(
     request_id: String,
     option_id: String,
     origin: PermissionAnswerOrigin,
-) {
+    phase: Option<crate::models::assistant::AssistantRunPhase>,
+) -> Option<crate::models::assistant::AssistantRunPhase> {
     let resolved = queue.resolve(&request_id, option_id.clone());
     if !resolved.answered {
-        return;
+        return None;
     }
     let decided_at = chrono::Utc::now();
     // Pairs with the `shown` line: a watchdog reading only the raise side can't
@@ -3545,6 +3579,7 @@ async fn resolve_permission_locked(
         )
         .await;
     }
+    phase
 }
 
 /// Publish the card a departing one promoted onto the screen, with `depth`
@@ -13724,6 +13759,7 @@ async fn run_conversation_loop(
     let mut prompted = false;
     let mut revision_prompt = None;
     let mut revision_request_id: Option<String> = None;
+    let mut plan_execution_fallback = PlanExecutionFallback::default();
     loop {
         // Wait for either a user command or a session update (e.g. available_commands_update)
         let cmd = loop {
@@ -13787,6 +13823,7 @@ async fn run_conversation_loop(
                         if let Err(e) = MatchDispatch::new(dispatch)
                             .if_notification(
                                 async |notif: SessionNotification| {
+                                    plan_execution_fallback.observe(&notif.update);
                                     // BEFORE the emit: it overwrites the very
                                     // state the comparison reads.
                                     if let SessionUpdate::ConfigOptionUpdate(update) = &notif.update {
@@ -13824,8 +13861,11 @@ async fn run_conversation_loop(
                         }
                     }
                 }
+                _ = plan_execution_fallback.ready() => {
+                    plan_execution_fallback.apply(&session.connection(), session.session_id(), state, emitter).await;
+                }
             }
-            // Reached only on the update arm (the command arm breaks out), so
+            // Reached on the update or fallback arm (the command arm breaks out), so
             // `session` is free again here.
             for (config_id, value_id) in std::mem::take(&mut config_drift_to_reassert) {
                 tracing::info!(
@@ -14237,6 +14277,7 @@ async fn run_conversation_loop(
                             } else if let Err(e) = MatchDispatch::new(dispatch)
                                 .if_notification(
                                     async |notif: SessionNotification| {
+                                        plan_execution_fallback.observe(&notif.update);
                                         // Body lives in a named `-> ()`
                                         // function so this closure is
                                         // infallible by construction —
@@ -14476,7 +14517,7 @@ async fn run_conversation_loop(
                             // explained by the AIR banner, so synthesizing an
                             // "empty" toast on top would misdiagnose a dead
                             // connection as "the agent produced nothing".
-                            let revising = state.read().await.plan_revisions.has_accepted();
+                            let revising = state.read().await.plan_revisions.is_revising();
                             let (reason_str, empty_report) = if terminal_failure
                                 .as_ref()
                                 .is_some_and(|record| record.severity == "error")
@@ -14617,6 +14658,9 @@ async fn run_conversation_loop(
                             }
                             break;
                         }
+                        _ = plan_execution_fallback.ready() => {
+                            plan_execution_fallback.apply(&cx, &sid, state, emitter).await;
+                        }
                         _ = terminal_poll_interval.tick(), if !tracked_terminal_tool_calls.is_empty() => {
                             poll_tracked_terminal_tool_calls(
                                 terminal_runtime.as_ref(),
@@ -14630,7 +14674,8 @@ async fn run_conversation_loop(
                         cmd = cmd_rx.recv() => {
                             match cmd {
                                 Some(ConnectionCommand::RequestPlanChanges { request_id, feedback, reply }) => {
-                                    let result = request_plan_changes(perms, state, emitter, request_id, feedback).await;
+                                    let result = request_plan_changes(perms, state, emitter, request_id, feedback, delegation_injection).await;
+                                    if result.is_ok() { plan_execution_fallback.cancel(); }
                                     let _ = reply.send(result);
                                 }
                                 Some(ConnectionCommand::RespondPermission {
@@ -14638,12 +14683,13 @@ async fn run_conversation_loop(
                                     option_id,
                                     origin,
                                 }) => {
-                                    resolve_permission(
-                                        perms, state, emitter, request_id, option_id, origin,
-                                    )
-                                    .await;
+                                    let phase = resolve_permission(
+                                        perms, state, emitter, request_id, option_id, origin, delegation_injection,
+                                    ).await;
+                                    plan_execution_fallback.decided(phase);
                                 }
                                 Some(ConnectionCommand::SetMode { mode_id, reply }) => {
+                                    plan_execution_fallback.cancel();
                                     let req = SetSessionModeRequest::new(sid.clone(), mode_id.clone());
                                     let outcome = match cx.send_request_to(Agent, req).block_task().await {
                                         Ok(_) => {
@@ -14685,6 +14731,9 @@ async fn run_conversation_loop(
                                     value_id,
                                     reply,
                                 }) => {
+                                    if config_id == "collaboration_mode" || config_id == "mode" {
+                                        plan_execution_fallback.cancel();
+                                    }
                                     let set_result = set_config_option_for_agent(
                                         agent_type, &cx, &sid, state, emitter, config_id,
                                         value_id,
@@ -15008,7 +15057,8 @@ async fn run_conversation_loop(
                 .await;
             }
             Some(ConnectionCommand::RequestPlanChanges { request_id, feedback, reply }) => {
-                let result = request_plan_changes(perms, state, emitter, request_id, feedback).await;
+                let result = request_plan_changes(perms, state, emitter, request_id, feedback, delegation_injection).await;
+                if result.is_ok() { plan_execution_fallback.cancel(); }
                 let _ = reply.send(result);
             }
             Some(ConnectionCommand::RespondPermission {
@@ -15016,9 +15066,11 @@ async fn run_conversation_loop(
                 option_id,
                 origin,
             }) => {
-                resolve_permission(perms, state, emitter, request_id, option_id, origin).await;
+                let phase = resolve_permission(perms, state, emitter, request_id, option_id, origin, delegation_injection).await;
+                plan_execution_fallback.decided(phase);
             }
             Some(ConnectionCommand::SetMode { mode_id, reply }) => {
+                plan_execution_fallback.cancel();
                 let outcome = match set_session_mode(session, state, emitter, mode_id.clone()).await
                 {
                     // `set_session_mode` only returns once the agent answered.
@@ -15049,6 +15101,9 @@ async fn run_conversation_loop(
                 value_id,
                 reply,
             }) => {
+                if config_id == "collaboration_mode" || config_id == "mode" {
+                    plan_execution_fallback.cancel();
+                }
                 let cx = session.connection();
                 let sid = session.session_id().clone();
                 let set_result = set_config_option_for_agent(
@@ -24064,6 +24119,7 @@ mod tests {
             shown.clone(),
             "deny".to_string(),
             policy.clone(),
+            None,
         )
         .await;
         // The same option again, from a person: a no-op.
@@ -24074,6 +24130,7 @@ mod tests {
             shown.clone(),
             "deny".to_string(),
             PermissionAnswerOrigin::User,
+            None,
         )
         .await;
 

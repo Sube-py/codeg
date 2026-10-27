@@ -4050,6 +4050,7 @@ mod tests {
             agent_config: AssistantAgentConfig {
                 agent_type,
                 agent_options: Default::default(),
+                after_plan_options: None,
                 label_snapshot: AssistantLabelSnapshot {
                     agent: "agent".into(),
                     mode: None,
@@ -4656,6 +4657,7 @@ mod tests {
                 agent_config: AssistantAgentConfig {
                     agent_type: AgentType::Codex,
                     agent_options: Default::default(),
+                    after_plan_options: None,
                     label_snapshot: AssistantLabelSnapshot {
                         agent: "Codex CLI".into(),
                         mode: None,

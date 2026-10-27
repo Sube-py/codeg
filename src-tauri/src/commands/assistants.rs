@@ -249,6 +249,7 @@ mod tests {
             agent_config: AssistantAgentConfig {
                 agent_type: AgentType::ClaudeCode,
                 agent_options: selection(None, &[("model", "opus")]),
+                after_plan_options: None,
                 label_snapshot: AssistantLabelSnapshot {
                     agent: "Claude Code".to_string(),
                     mode: None,

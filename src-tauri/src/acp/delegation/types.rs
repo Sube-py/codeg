@@ -55,11 +55,39 @@ pub struct DelegationAssistant {
     pub name: String,
     #[serde(default)]
     pub agent_options: AgentDelegationDefaults,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_plan_options: Option<AgentDelegationDefaults>,
     #[serde(default)]
     pub instructions: String,
 }
 
 impl DelegationAssistant {
+    /// Only a new connection replays this choice; live mode switches stay live.
+    pub fn options_for_phase(
+        &self,
+        phase: Option<crate::models::assistant::AssistantRunPhase>,
+    ) -> AgentDelegationDefaults {
+        let mut options = self.agent_options.clone();
+        // Approving the plan leaves this run. A reconnect must not put the
+        // session back in plan; there is no second policy to replay. Codex
+        // stores the choice as `collaboration_mode`, other agents as `mode_id`.
+        if phase == Some(crate::models::assistant::AssistantRunPhase::Executing) {
+            if options
+                .config_values
+                .get("collaboration_mode")
+                .is_some_and(|mode| mode == "plan")
+            {
+                options
+                    .config_values
+                    .insert("collaboration_mode".to_string(), "default".to_string());
+            }
+            if options.mode_id.as_deref() == Some("plan") {
+                options.mode_id = Some("default".to_string());
+            }
+        }
+        options
+    }
+
     pub fn identity(&self) -> AssistantRef {
         AssistantRef {
             id: self.id,
@@ -72,6 +100,7 @@ impl DelegationAssistant {
         crate::models::AssistantRunSnapshot {
             name: self.name.clone(),
             agent_options: self.agent_options.clone(),
+            after_plan_options: self.after_plan_options.clone(),
             instructions: self.instructions.clone(),
         }
     }
@@ -308,6 +337,14 @@ pub trait DelegationTaskLedger: Send + Sync {
     /// Drop a continue round that never sent a prompt, releasing its
     /// one-successor slot for a retry. Default: no-op.
     async fn discard(&self, _task_id: &str) {}
+    /// Stored beside the child session, shared by all of its rounds.
+    async fn set_run_phase(
+        &self,
+        _child_conversation_id: i32,
+        _phase: crate::models::assistant::AssistantRunPhase,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
 }
 
 /// Default ledger — every lookup is a miss, every write a no-op. Used by the
